@@ -1,4 +1,4 @@
-// [LOCAL SAFE BUILD] 基于纯净版，仅增加：meta静默读取、export实时导出、纪要安全合并保存。
+// [LOCAL SAFE BUILD] 基于纯净版，增加：meta静默读取、仪表盘安全导出、纪要安全合并保存、自动/手动更新后同步纪要到持久层。
 // ==UserScript==
 // @name         SP·数据库 III
 // @namespace    http://tampermonkey.net/
@@ -6378,8 +6378,9 @@ $CONTENT
             try {
                 const provider = getStorageProvider();
                 const result = provider.applyEdits(editsString, updateMode);
-                logDebug_ACU(`[SQL Mode] applyEdits 完成: success=${result.success}, appliedEdits=${result.appliedEdits}, modifiedKeys=${result.modifiedKeys.join(',')}`);
-                return result;
+                const summaryTouched = sqlTextTouchesSummaryTable_ACU$local(editsString);
+                logDebug_ACU(`[SQL Mode] applyEdits 完成: success=${result.success}, appliedEdits=${result.appliedEdits}, modifiedKeys=${result.modifiedKeys.join(',')}, summaryTouched=${summaryTouched}`);
+                return { ...result, summaryTouched };
             }
             catch (e) {
                 // SQL 执行失败，抛出错误供上层重试循环捕获
@@ -32565,6 +32566,7 @@ $CONTENT
         };
         let success = false;
         let modifiedKeys = [];
+        let summaryTouchedBySql = false;
         const maxRetries = settings_ACU.tableMaxRetries || 3;
         try {
             emitProgress({ phase: 'preparing' });
@@ -32607,6 +32609,9 @@ $CONTENT
                     if (typeof parseResult === 'object' && parseResult !== null) {
                         parseSuccess = parseResult.success;
                         modifiedKeys = parseResult.modifiedKeys || [];
+                        if (parseResult.summaryTouched === true) {
+                            summaryTouchedBySql = true;
+                        }
                     }
                     else {
                         parseSuccess = !!parseResult;
@@ -32682,6 +32687,16 @@ $CONTENT
                     }
                     else {
                         logDebug_ACU("No tables were modified by AI, skipping save to chat history.");
+                    }
+                    if (isSqliteMode() && (summaryTouchedBySql || sheetKeyListTouchesSummary_ACU$local(modifiedKeys) || sheetKeyListTouchesSummary_ACU$local(targetSheetKeys))) {
+                        emitProgress({ phase: 'saving', message: '正在同步纪要到持久层' });
+                        const mergeResult = await safeMergeSaveSummaryToPersistent_ACU('auto_after_table_update');
+                        if (!mergeResult?.success) {
+                            logWarn_ACU(`[AutoSafeMergeSummary] 自动同步纪要到持久层失败：${mergeResult?.error || 'unknown'}`);
+                        }
+                        else {
+                            logDebug_ACU(`[AutoSafeMergeSummary] 自动同步完成：updated=${mergeResult.updated || 0}, appended=${mergeResult.appended || 0}, totalRows=${mergeResult.totalRows || 0}`);
+                        }
                     }
                     await updateReadableLorebookEntry_ACU(true);
                 }
@@ -42519,7 +42534,7 @@ $CONTENT
             }
             $execStatus.html('<span class="notes">正在安全合并保存纪要...</span>');
             try {
-                const result = await safeMergeSaveSummaryToPersistent_ACU();
+                const result = await safeMergeSaveSummaryToPersistent_ACU('button_click');
                 if (!result?.success) {
                     const errMsg = result?.error || '未知错误';
                     $resultArea.html(`<div style="color: #e95e5e; padding: 12px; font-family: monospace; white-space: pre-wrap;">安全合并保存失败：${escapeHtml_ACU$1(errMsg)}</div>`);
@@ -42545,7 +42560,7 @@ $CONTENT
     /**
      * 执行 SQL 并渲染结果
      */
-    function executeSql(sql, $resultArea, $execStatus) {
+    async function executeSql(sql, $resultArea, $execStatus) {
         const startTime = performance.now();
         try {
             const provider = getStorageProvider();
@@ -42577,8 +42592,29 @@ $CONTENT
                 }
                 else {
                     addHistory(sql, true);
-                    $resultArea.html(`<div style="padding: 12px; color: #a6e3a1;">✓ 执行成功，${result.changes} 行受影响</div>`);
-                    $execStatus.html(`<span style="color: #a6e3a1;">✓ ${result.changes} 行受影响, ${elapsed}ms</span>`);
+                    let html = `<div style="padding: 12px; color: #a6e3a1; line-height: 1.7;">✓ 执行成功，${result.changes} 行受影响`;
+                    let statusText = `✓ ${result.changes} 行受影响, ${elapsed}ms`;
+                    if (sqlTextTouchesSummaryTable_ACU$local(sql)) {
+                        $execStatus.html(`<span class="notes">变更成功，正在同步纪要到持久层...</span>`);
+                        const mergeResult = await safeMergeSaveSummaryToPersistent_ACU('manual_sql_console');
+                        if (mergeResult?.success) {
+                            if (mergeResult.queued) {
+                                html += `<br>↻ 纪要同步请求已排队`;
+                                statusText += `，纪要同步已排队`;
+                            }
+                            else {
+                                html += `<br>✓ 已同步纪要到持久层：更新 ${mergeResult.updated || 0} 条，追加 ${mergeResult.appended || 0} 条，总计 ${mergeResult.totalRows || 0} 条`;
+                                statusText += `，纪要已同步`;
+                            }
+                        }
+                        else {
+                            html += `<br><span style="color: #f9e2af;">⚠ 纪要同步失败：${escapeHtml_ACU$1(mergeResult?.error || '未知错误')}</span>`;
+                            statusText += `，纪要同步失败`;
+                        }
+                    }
+                    html += `</div>`;
+                    $resultArea.html(html);
+                    $execStatus.html(`<span style="color: #a6e3a1;">${statusText}</span>`);
                     logDebug_ACU(`[SQL Console] 变更成功: ${result.changes} 行, ${elapsed}ms`);
                 }
             }
@@ -47907,8 +47943,27 @@ $CONTENT
             totalRows: mergedRows.length,
         };
     }
-    async function safeMergeSaveSummaryToPersistent_ACU() {
+    function sqlTextTouchesSummaryTable_ACU$local(sqlText) {
+        const text = String(sqlText || '');
+        return /chronicle/i.test(text) || /sheet_summary/i.test(text) || /纪要表/.test(text);
+    }
+    function sheetKeyListTouchesSummary_ACU$local(keys) {
+        if (!Array.isArray(keys) || keys.length === 0)
+            return false;
         try {
+            const entry = findSummarySheetEntry_ACU$local(currentJsonTableData_ACU);
+            if (entry && keys.includes(entry.key))
+                return true;
+        }
+        catch (_) { }
+        return keys.some(k => String(k || '').toLowerCase().includes('summary'));
+    }
+    let safeMergeSummarySaving_ACU$local = false;
+    let safeMergeSummaryPending_ACU$local = false;
+
+    async function safeMergeSaveSummaryToPersistentCore_ACU(reason = 'manual') {
+        try {
+            logDebug_ACU(`[safeMergeSaveSummary] 开始同步纪要到持久层，reason=${reason}`);
             const persistentData = await mergeAllIndependentTables_ACU();
             if (!persistentData || !Object.keys(persistentData).some(k => k.startsWith('sheet_'))) {
                 throw new Error('未找到聊天持久层表格数据，无法以持久层为底稿进行安全合并。');
@@ -47956,6 +48011,27 @@ $CONTENT
         }
     }
 
+    async function safeMergeSaveSummaryToPersistent_ACU(reason = 'manual') {
+        if (safeMergeSummarySaving_ACU$local) {
+            safeMergeSummaryPending_ACU$local = true;
+            logWarn_ACU(`[safeMergeSaveSummary] 已有同步任务执行中，本次请求排队: ${reason}`);
+            return { success: true, queued: true, reason };
+        }
+        safeMergeSummarySaving_ACU$local = true;
+        let lastResult = null;
+        try {
+            do {
+                safeMergeSummaryPending_ACU$local = false;
+                lastResult = await safeMergeSaveSummaryToPersistentCore_ACU(reason);
+            } while (safeMergeSummaryPending_ACU$local);
+            return lastResult || { success: true, reason };
+        }
+        finally {
+            safeMergeSummarySaving_ACU$local = false;
+        }
+    }
+
+
     /**
      * presentation/bootstrap/api-groups/core-data-api.ts
      * 核心数据操作 API — exportTableAsJson / importTableAsJson / triggerUpdate
@@ -47972,7 +48048,7 @@ $CONTENT
             },
             // 安全合并保存纪要：持久层为底稿，SQLite/JSON 当前纪要表为补丁。
             safeMergeSaveToChat: async function () {
-                return safeMergeSaveSummaryToPersistent_ACU();
+                return safeMergeSaveSummaryToPersistent_ACU('api_call');
             },
             // 导入并覆盖当前表格数据
             importTableAsJson: async function (jsonString) {
