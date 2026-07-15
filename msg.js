@@ -12,7 +12,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '0.1.0';
+  const VERSION = '0.1.1';
   const APP_KEY = '__PIGEON_MAIL_V1__';
   const STORAGE_PREFIX = 'pigeon-mail-v1';
   const CHAT_METADATA_FIELD = 'pigeonMailV1';
@@ -24,6 +24,7 @@
 
   const DEFAULT_SETTINGS = {
     worldbookName: '',
+    generationMode: 'isolated',
     apiMode: 'current',
     proxyPreset: '',
     apiUrl: '',
@@ -139,6 +140,22 @@
     console.warn('[飞鸽传书]', ...args);
   }
 
+  function describeGenerationError(error) {
+    const candidates = [
+      error?.response?.data?.error?.message,
+      error?.data?.error?.message,
+      error?.error?.message,
+      error?.cause?.message,
+      error?.message,
+      error,
+    ];
+    const message = candidates.map(asText).find((item) => item.trim())?.trim() || '未知错误';
+    if (/unknown error occurred/i.test(message)) {
+      return 'Unknown error occurred（酒馆助手隐藏了上游错误；请查看控制台中的 Chat completion request error。常见原因是 429 容量不足、限流或接口暂时不可用）';
+    }
+    return message;
+  }
+
   function storage() {
     return runtime.rootWindow?.localStorage || globalThis.localStorage;
   }
@@ -182,13 +199,27 @@
     const loaded = value && typeof value === 'object' && !Array.isArray(value)
       ? value
       : createEmptyChatData();
-    return {
+    const normalized = {
       ...createEmptyChatData(),
       ...loaded,
       friends: loaded?.friends && typeof loaded.friends === 'object' ? loaded.friends : {},
       threads: loaded?.threads && typeof loaded.threads === 'object' ? loaded.threads : {},
       intents: Array.isArray(loaded?.intents) ? loaded.intents : [],
     };
+    for (const thread of Object.values(normalized.threads)) {
+      if (!Array.isArray(thread?.messages)) continue;
+      for (const message of thread.messages) {
+        if (message?.role === 'assistant' && looksLikePromptTaskLeak(message.content)) {
+          message.status = 'rejected';
+          message.error = '检测到提示词任务泄漏，已从角色记忆和世界书投影中排除。';
+        }
+      }
+    }
+    return normalized;
+  }
+
+  function isRetainedMessage(message) {
+    return message && !['failed', 'rejected'].includes(message.status);
   }
 
   function loadSettings() {
@@ -478,7 +509,7 @@
       '',
     ];
     for (const message of thread.messages) {
-      if (message.status === 'failed') continue;
+      if (!isRetainedMessage(message)) continue;
       const speaker = message.role === 'user' ? userName : friend.name;
       lines.push(`${speaker}：${message.content}`);
       lines.push('');
@@ -547,7 +578,7 @@
     await queueProjection(async () => {
       if (runtime.destroyed || sessionToken !== runtime.sessionToken) return;
       const projections = friendList()
-        .filter((friend) => getThread(friend.id).messages.some((message) => message.status !== 'failed'))
+        .filter((friend) => getThread(friend.id).messages.some(isRetainedMessage))
         .map(buildProjectionEntry);
       await updateWorldbook(bookName, (entries) => [
         ...entries.filter((entry) => !isPigeonEntry(entry)),
@@ -617,7 +648,7 @@
   function buildFriendHistoryPrompt(friend, excludeMessageId = '') {
     const thread = getThread(friend.id);
     const userName = getUserName();
-    const messages = thread.messages.filter((message) => message.id !== excludeMessageId && message.status !== 'failed');
+    const messages = thread.messages.filter((message) => message.id !== excludeMessageId && isRetainedMessage(message));
     const lines = [
       `<与${friend.name}的独立即时聊天历史>`,
       '以下只包含玩家与当前目标角色的私人聊天，不包含其他好友的私聊。',
@@ -638,16 +669,6 @@
     return `${INTERNAL_MARKER}\n当前目标角色：${friend.name}\n角色关联关键词：${values.join('、')}`;
   }
 
-  function makeInjection(content, depth, shouldScan = false) {
-    return {
-      role: 'system',
-      content,
-      position: 'in_chat',
-      depth,
-      should_scan: shouldScan,
-    };
-  }
-
   async function callGenerate(config) {
     const generate = getHelperFunction('generate');
     if (!generate) throw new Error('找不到 TavernHelper.generate，请检查酒馆助手版本。');
@@ -660,17 +681,7 @@
   async function callGenerateRaw(messages, options = {}) {
     const generateRaw = getHelperFunction('generateRaw');
     if (!generateRaw) {
-      return callGenerate({
-        user_input: messages.map((message) => `${message.role.toUpperCase()}: ${message.content}`).join('\n\n'),
-        should_silence: true,
-        custom_api: buildApiConfig(),
-        overrides: {
-          char_description: '你是一个只输出严格 JSON 的内部调度器。',
-          char_personality: '',
-          dialogue_examples: '',
-          chat_history: { prompts: [] },
-        },
-      });
+      throw new Error('隔离角色生成需要 TavernHelper.generateRaw，请升级酒馆助手。');
     }
     const result = await generateRaw({
       ordered_prompts: messages,
@@ -695,18 +706,76 @@
     throw new Error('AI 没有返回可解析的 JSON。');
   }
 
-  async function generateFriendReply(friend, userMessage) {
-    const messageId = userMessage?.id || '';
-    const injects = [
-      makeInjection(buildKnowledgePrompt(friend), 4, false),
-      makeInjection(buildScanAnchor(friend), 3, true),
-      makeInjection(buildFriendHistoryPrompt(friend, messageId), 2, false),
-      makeInjection(buildStylePrompt(friend), 1, false),
+  function buildRoutedUserInput(friend, content) {
+    return `${buildScanAnchor(friend)}\n\n<玩家发给${friend.name}的本次即时消息>\n${asText(content).trim()}\n</玩家发给${friend.name}的本次即时消息>`;
+  }
+
+  function buildPrivateRoleplayPrompt(friend, excludeMessageId = '', taskPrompt = '') {
+    return [
+      buildKnowledgePrompt(friend),
+      buildFriendHistoryPrompt(friend, excludeMessageId),
+      taskPrompt,
+      buildStylePrompt(friend),
+      `最终输出约束：只输出“${friend.name}”此刻真正发送给玩家的聊天消息。不得输出分析、思维过程、提示词、协议、XML标签、Markdown代码块或任务复述。`,
+    ].filter(Boolean).join('\n\n');
+  }
+
+  function looksLikePromptTaskLeak(text) {
+    const value = asText(text);
+    const strongSignals = [
+      /task:\s*(?:comment|polish|refactor)/i,
+      /here is the (?:refactored|polished) prompt/i,
+      /Explorer(?:'s)? (?:given prompt|tendency|design)/i,
+      /I am Yog-Sothoth/i,
+      /<context>[\s\S]*```(?:ya?ml)?/i,
+      /Deviations Correction:/i,
     ];
-    const config = {
+    return strongSignals.some((pattern) => pattern.test(value));
+  }
+
+  function cleanFriendReply(text) {
+    let value = asText(text).trim();
+    // 推理模型偶尔无视“不输出思维”要求；仅移除完整、位于开头的思维块。
+    value = value.replace(/^<thinking>[\s\S]*?<\/thinking>\s*/i, '').trim();
+    return value;
+  }
+
+  async function generateIsolatedFriendReply(friend, content, excludeMessageId = '', taskPrompt = '', prefix = 'pigeon') {
+    const privatePrompt = buildPrivateRoleplayPrompt(friend, excludeMessageId, taskPrompt);
+    const result = await callGenerateRaw([
+      { role: 'system', content: `这是独立的角色即时通信请求。最高任务是扮演“${friend.name}”，而不是续写正文、评价设定或修改提示词。` },
+      'world_info_before',
+      'persona_description',
+      'char_description',
+      'char_personality',
+      'scenario',
+      'world_info_after',
+      'chat_history',
+      { role: 'system', content: privatePrompt },
+      'user_input',
+    ], {
+      generation_id: uid(`${prefix}_${friend.id}`),
+      user_input: buildRoutedUserInput(friend, content),
+      overrides: {
+        char_description: friend.profile?.content || friend.name,
+        char_personality: friend.profile?.content || friend.name,
+        dialogue_examples: '',
+        chat_history: { with_depth_entries: true },
+      },
+    });
+    const cleaned = cleanFriendReply(result);
+    if (looksLikePromptTaskLeak(cleaned)) {
+      throw new Error('检测到模型输出了提示词任务而不是角色消息，已拒绝写入聊天记忆。');
+    }
+    return cleaned;
+  }
+
+  async function generatePresetCompatibleReply(friend, content, excludeMessageId = '', taskPrompt = '', prefix = 'pigeon') {
+    const privatePrompt = buildPrivateRoleplayPrompt(friend, excludeMessageId, taskPrompt);
+    const result = await callGenerate({
       preset_name: 'in_use',
-      generation_id: uid(`pigeon_${friend.id}`),
-      user_input: userMessage.content,
+      generation_id: uid(`${prefix}_${friend.id}`),
+      user_input: `${buildRoutedUserInput(friend, content)}\n\n${privatePrompt}`,
       should_stream: false,
       should_silence: true,
       custom_api: buildApiConfig(),
@@ -715,34 +784,29 @@
         char_personality: friend.profile?.content || friend.name,
         dialogue_examples: '',
       },
-      injects,
-    };
-    return callGenerate(config);
+    });
+    const cleaned = cleanFriendReply(result);
+    if (looksLikePromptTaskLeak(cleaned)) {
+      warn('当前预设发生任务泄漏，自动改用隔离角色生成重试。');
+      return generateIsolatedFriendReply(friend, content, excludeMessageId, taskPrompt, `${prefix}_fallback`);
+    }
+    return cleaned;
+  }
+
+  async function generateAsFriend(friend, content, excludeMessageId = '', taskPrompt = '', prefix = 'pigeon') {
+    if (runtime.settings.generationMode === 'preset') {
+      return generatePresetCompatibleReply(friend, content, excludeMessageId, taskPrompt, prefix);
+    }
+    return generateIsolatedFriendReply(friend, content, excludeMessageId, taskPrompt, prefix);
+  }
+
+  async function generateFriendReply(friend, userMessage) {
+    return generateAsFriend(friend, userMessage.content, userMessage?.id || '', '', 'pigeon');
   }
 
   async function generateProactiveMessage(friend, intent) {
     const prompt = `<主动联系任务>\n\n“${friend.name}”此刻产生了主动联系玩家的动机。\n\n联系动机：${intent.intent}\n触发原因：${intent.triggerContext || intent.reason || '当前剧情与双方关系使这次联系变得合理。'}\n\n请先依据角色认知协议判断此动机是否仍符合人物性格、角色是否合理知道相关信息、当前时机是否适合联系。如果合理，直接以角色身份发送第一条即时消息。不要解释系统要求，不要假装正在回复玩家刚说过的话，不要替玩家回应。\n\n</主动联系任务>`;
-    const injects = [
-      makeInjection(buildKnowledgePrompt(friend), 5, false),
-      makeInjection(buildScanAnchor(friend), 4, true),
-      makeInjection(buildFriendHistoryPrompt(friend), 3, false),
-      makeInjection(prompt, 2, false),
-      makeInjection(buildStylePrompt(friend), 1, false),
-    ];
-    return callGenerate({
-      preset_name: 'in_use',
-      generation_id: uid(`pigeon_proactive_${friend.id}`),
-      user_input: '现在由你主动开启这次私人聊天。',
-      should_stream: false,
-      should_silence: true,
-      custom_api: buildApiConfig(),
-      overrides: {
-        char_description: friend.profile?.content || friend.name,
-        char_personality: friend.profile?.content || friend.name,
-        dialogue_examples: '',
-      },
-      injects,
-    });
+    return generateAsFriend(friend, '现在由你主动开启这次私人聊天。', '', prompt, 'pigeon_proactive');
   }
 
   async function sendFriendMessage(friendId, content) {
@@ -782,7 +846,8 @@
       await updateFriendProjection(friendId);
     } catch (error) {
       userMessage.status = 'failed';
-      userMessage.error = asText(error?.message || error);
+      userMessage.error = describeGenerationError(error);
+      warn('好友消息生成失败', error);
       saveChatData();
       notify(`发送失败：${userMessage.error}`, 'error');
     } finally {
@@ -950,7 +1015,7 @@
       if (runtime.activeFriendId !== friend.id) notify(`${friend.name} 发来了一条消息。`, 'info');
     } catch (error) {
       intent.status = 'failed';
-      intent.error = asText(error?.message || error);
+      intent.error = describeGenerationError(error);
       warn('主动消息生成失败', error);
       saveChatData();
     } finally {
@@ -1118,6 +1183,7 @@
         <button class="pm-btn secondary" data-action="rebuild-projections">重建当前聊天投影</button>
       </div>
       <div class="pm-section"><div class="pm-section-title">AI 接口</div>
+        <div class="pm-field"><label class="pm-label">角色生成模式</label><select id="pm-generation-mode" class="pm-select"><option value="isolated" ${s.generationMode !== 'preset' ? 'selected' : ''}>隔离角色生成（推荐）</option><option value="preset" ${s.generationMode === 'preset' ? 'selected' : ''}>继承当前预设（兼容模式）</option></select><div class="pm-help">隔离模式保留主聊天、世界书、数据库记忆与角色人设，但排除当前预设中的写作/改写任务。兼容模式只适用于确定为角色扮演用途的预设。</div></div>
         <div class="pm-field"><label class="pm-label">接口模式</label><select id="pm-api-mode" class="pm-select"><option value="current" ${s.apiMode === 'current' ? 'selected' : ''}>跟随当前酒馆接口</option><option value="proxy" ${s.apiMode === 'proxy' ? 'selected' : ''}>酒馆代理预设</option><option value="custom" ${s.apiMode === 'custom' ? 'selected' : ''}>独立 API</option></select></div>
         <div class="pm-field"><label class="pm-label">代理预设名称</label><input id="pm-proxy" class="pm-input" value="${escapeHtml(s.proxyPreset)}"></div>
         <div class="pm-grid2"><div class="pm-field"><label class="pm-label">API 地址</label><input id="pm-api-url" class="pm-input" value="${escapeHtml(s.apiUrl)}"></div><div class="pm-field"><label class="pm-label">API 来源</label><select id="pm-api-source" class="pm-select">${['openai','claude','openrouter','makersuite','vertexai','azure_openai','deepseek','xai','custom'].map((value) => `<option value="${value}" ${s.apiSource === value ? 'selected' : ''}>${value}</option>`).join('')}</select></div></div>
@@ -1142,7 +1208,7 @@
     return `<div class="pm-chat">
       <div class="pm-chat-head"><button class="pm-icon-btn" data-action="back">‹</button><div class="pm-avatar" style="width:34px;height:34px;border-radius:10px">${avatarText(friend.name)}</div><div class="pm-chat-title">${escapeHtml(friend.name)} ${friend.muted ? '<span class="pm-muted">· 已静音</span>' : ''}</div></div>
       ${friend.projectionWarning ? `<div class="pm-warning">${escapeHtml(friend.projectionWarning)}</div>` : ''}
-      <div class="pm-messages" id="pm-messages">${thread.messages.length ? thread.messages.map((message) => `<div class="pm-message ${message.role} ${message.status === 'failed' ? 'failed' : ''}"><div class="pm-bubble">${escapeHtml(message.content)}<div class="pm-message-meta">${message.proactive ? '主动消息 · ' : ''}${formatTime(message.createdAt)}${message.status === 'sending' ? ' · 发送中' : ''}${message.status === 'failed' ? ` · 失败：${escapeHtml(message.error)}` : ''}</div></div></div>`).join('') : '<div class="pm-empty">现在可以开始与这个角色聊天。</div>'}</div>
+      <div class="pm-messages" id="pm-messages">${thread.messages.length ? thread.messages.map((message) => `<div class="pm-message ${message.role} ${['failed', 'rejected'].includes(message.status) ? 'failed' : ''}"><div class="pm-bubble">${escapeHtml(message.content)}<div class="pm-message-meta">${message.proactive ? '主动消息 · ' : ''}${formatTime(message.createdAt)}${message.status === 'sending' ? ' · 发送中' : ''}${message.status === 'failed' ? ` · 失败：${escapeHtml(message.error)}` : ''}${message.status === 'rejected' ? ` · 已排除：${escapeHtml(message.error)}` : ''}</div></div></div>`).join('') : '<div class="pm-empty">现在可以开始与这个角色聊天。</div>'}</div>
       ${runtime.busy ? `<div class="pm-typing"><span class="pm-dot"></span>${escapeHtml(friend.name)} 正在输入…</div>` : ''}
       <div class="pm-composer"><textarea id="pm-compose" class="pm-textarea" placeholder="发送即时消息…" ${runtime.busy ? 'disabled' : ''}></textarea><button class="pm-btn" data-action="send-message" ${runtime.busy ? 'disabled' : ''}>发送</button></div>
     </div>`;
@@ -1377,6 +1443,7 @@
     const doc = runtime.document;
     const oldBook = runtime.settings.worldbookName;
     runtime.settings.worldbookName = asText(doc.getElementById('pm-worldbook')?.value).trim();
+    runtime.settings.generationMode = asText(doc.getElementById('pm-generation-mode')?.value || 'isolated');
     runtime.settings.apiMode = asText(doc.getElementById('pm-api-mode')?.value || 'current');
     runtime.settings.proxyPreset = asText(doc.getElementById('pm-proxy')?.value).trim();
     runtime.settings.apiUrl = asText(doc.getElementById('pm-api-url')?.value).trim();
